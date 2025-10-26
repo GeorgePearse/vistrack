@@ -1,31 +1,34 @@
 """
-A customizable lightweight Python library for real-time multi-object tracking.
+High-performance multi-object tracking using Similari's Rust backend.
+
+Vistrack provides a clean, easy-to-use interface for real-time multi-object tracking
+with bounding boxes. It leverages Similari's VisualSORT algorithm for high performance.
 
 Examples
 --------
->>> from vistrack import Detection, Tracker, Video, draw_tracked_objects
->>> detector = MyDetector()  # Set up a detector
->>> video = Video(input_path="video.mp4")
->>> tracker = Tracker(distance_function="euclidean", distance_threshold=50)
->>> for frame in video:
->>>    detections = detector(frame)
->>>    vistrack_detections = [Detection(points) for points in detections]
->>>    tracked_objects = tracker.update(detections=vistrack_detections)
->>>    draw_tracked_objects(frame, tracked_objects)
->>>    video.write(frame)
+>>> from vistrack import Detection, Tracker
+>>> import numpy as np
+>>>
+>>> # Create tracker
+>>> tracker = Tracker(max_age=30, min_hits=3)
+>>>
+>>> # In your tracking loop
+>>> detections = [
+>>>     Detection(
+>>>         bbox=np.array([10, 20, 100, 150]),  # [x1, y1, x2, y2]
+>>>         confidence=0.9,
+>>>         feature=my_reid_feature,  # Optional appearance feature
+>>>     )
+>>> ]
+>>> tracked_objects = tracker.update(detections)
+>>> for obj in tracked_objects:
+>>>     print(f"Track {obj.id}: {obj.bbox}")
 """
+
 import sys
 
-from .distances import *
-from .drawing import *
-from .filter import (
-    FilterPyKalmanFilterFactory,
-    NoFilterFactory,
-    OptimizedKalmanFilterFactory,
-)
-from .tracker import Detection, Tracker
-from .utils import get_cutout, print_objects_as_table
-from .video import Video
+from .tracker import Detection, Tracker, TrackedObject
+from .distances import euclidean_distance, cosine_distance, iou_distance
 
 if sys.version_info >= (3, 8):
     import importlib.metadata
@@ -35,3 +38,12 @@ elif sys.version_info < (3, 8):
     import importlib_metadata
 
     __version__ = importlib_metadata.version(__name__)
+
+__all__ = [
+    "Detection",
+    "Tracker",
+    "TrackedObject",
+    "euclidean_distance",
+    "cosine_distance",
+    "iou_distance",
+]

@@ -2,7 +2,7 @@
 name = "vistrack"
 version = "2.3.0"
 description = "Lightweight Python library for adding real-time multi-object tracking to any detector."
-license = {text = "BSD-3-Clause"}
+license = {text = "Apache-2.0"}
 authors = [{name = "Tryolabs", email = "hello@tryolabs.com"}]
 readme = "README.md"
 requires-python = ">=3.9"
@@ -24,7 +24,7 @@ classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: BSD License",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -34,16 +34,14 @@ classifiers = [
     "Topic :: Multimedia :: Video"
 ]
 dependencies = [
-    "bayesian-filters>=1.4.5",
-    "rich>=9.10.0,<15.0.0",
-    "scipy>=1.5.4",
     "numpy>=1.23.0",
 ]
 
 [project.optional-dependencies]
 metrics = ["motmetrics==1.4.0"]
 video = ["opencv-python>=3.2.0,<5.0.0"]
-all = ["motmetrics==1.4.0", "opencv-python>=3.2.0,<5.0.0"]
+similari = ["similari-trackers-rs>=0.26.0"]  # Optional high-performance backend
+all = ["motmetrics==1.4.0", "opencv-python>=3.2.0,<5.0.0", "similari-trackers-rs>=0.26.0"]
 dev = ["pytest>=6.2.5", "ruff>=0.1.0", "pyright>=1.1.0", "tox>=3.26.0"]
 
 [project.urls]
@@ -66,5 +64,5 @@ ignore = ["E501"]  # Line too long - ignore for existing codebase
 
 [tool.pyright]
 python_version = "3.9"
-type_checking_mode = "basic"
-ignore = ["vistrack/**/*.py"]  # Relaxed type checking for existing codebase
+type_checking_mode = "standard"
+ignore = []

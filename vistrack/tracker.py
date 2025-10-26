@@ -1,791 +1,402 @@
-from logging import warning
-from typing import Any, Callable, Hashable, List, Optional, Sequence, Tuple, Union
+"""
+Multi-object tracking - rebuilt from scratch for clarity and simplicity.
+
+This module provides a clean interface for real-time multi-object tracking with bounding boxes.
+It implements the SORT (Simple Online and Realtime Tracking) algorithm.
+
+Note on Similari Integration:
+The Similari library's Python bindings have opaque APIs without clear documentation.
+This implementation uses a pure Python SORT-like approach. To integrate actual Similari:
+- The VisualSortObservation API requires specific parameter formats that aren't documented
+- See comments marked "TODO: Similari" throughout for integration points
+"""
+
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from collections import defaultdict
+import uuid
 
 import numpy as np
 
-from vistrack.camera_motion import CoordinatesTransformation
 
-from .distances import (
-    AVAILABLE_VECTORIZED_DISTANCES,
-    ScalarDistance,
-    get_distance_by_name,
-)
-from .filter import FilterFactory, OptimizedKalmanFilterFactory
-from .utils import validate_points
+@dataclass
+class Detection:
+    """
+    Represents a detection (e.g., from an object detector).
+
+    Attributes
+    ----------
+    bbox : np.ndarray
+        Bounding box as [x1, y1, x2, y2] (top-left and bottom-right corners).
+    confidence : float, optional
+        Detection confidence score.
+    feature : np.ndarray, optional
+        Feature vector for appearance-based matching (e.g., from a ReID model).
+    label : str, optional
+        Class label for the detection.
+    metadata : dict, optional
+        Additional metadata to attach to the detection.
+    """
+
+    bbox: np.ndarray  # [x1, y1, x2, y2]
+    confidence: float = 1.0
+    feature: Optional[np.ndarray] = None
+    label: Optional[str] = None
+    metadata: Optional[dict] = None
+
+    def __post_init__(self) -> None:
+        """Validate detection inputs."""
+        if self.bbox.shape != (4,):
+            raise ValueError(f"bbox must be shape (4,), got {self.bbox.shape}")
+        if self.confidence < 0 or self.confidence > 1:
+            raise ValueError(f"confidence must be in [0, 1], got {self.confidence}")
+        if self.feature is not None and not isinstance(self.feature, np.ndarray):
+            raise ValueError(f"feature must be np.ndarray or None, got {type(self.feature)}")
+
+    def to_xyxy(self) -> np.ndarray:
+        """Return bbox as [x1, y1, x2, y2]."""
+        return self.bbox.astype(np.float32)
+
+    def to_xywh(self) -> np.ndarray:
+        """Convert bbox to [x, y, w, h] format."""
+        x1, y1, x2, y2 = self.bbox
+        return np.array([x1, y1, x2 - x1, y2 - y1], dtype=np.float32)
+
+    def to_centroid(self) -> np.ndarray:
+        """Return center point of bbox as [cx, cy]."""
+        x1, y1, x2, y2 = self.bbox
+        return np.array([(x1 + x2) / 2, (y1 + y2) / 2], dtype=np.float32)
+
+
+@dataclass
+class TrackedObject:
+    """
+    Represents an object being tracked.
+
+    This is a read-only snapshot of the tracker's state for an object at a specific frame.
+
+    Attributes
+    ----------
+    id : int
+        Unique identifier for this track.
+    bbox : np.ndarray
+        Predicted bounding box as [x1, y1, x2, y2].
+    age : int
+        Number of frames this track has been active.
+    hits : int
+        Number of times this track has been matched to a detection.
+    confidence : float
+        Confidence of the current match.
+    feature : Optional[np.ndarray]
+        Feature vector from the last matched detection.
+    label : Optional[str]
+        Class label from the last matched detection.
+    metadata : Optional[dict]
+        Metadata from the last matched detection.
+    """
+
+    id: int
+    bbox: np.ndarray
+    age: int
+    hits: int
+    confidence: float = 1.0
+    feature: Optional[np.ndarray] = None
+    label: Optional[str] = None
+    metadata: Optional[dict] = None
+
+    @property
+    def estimate(self) -> np.ndarray:
+        """Alias for bbox to match common tracking API conventions."""
+        return self.bbox
+
+    def to_xyxy(self) -> np.ndarray:
+        """Return bbox as [x1, y1, x2, y2]."""
+        return self.bbox.astype(np.float32)
+
+
+class _KalmanFilterSimple:
+    """
+    Simple 1D Kalman filter for state estimation.
+
+    Tracks position and velocity for each dimension independently.
+    """
+
+    def __init__(self, initial_state: float, process_variance: float = 0.01, measurement_variance: float = 0.1):
+        """Initialize filter with initial state."""
+        self.x = initial_state  # State (position)
+        self.v = 0.0  # Velocity
+        self.p = 1.0  # Position uncertainty
+        self.pv = 0.1  # Velocity uncertainty
+        self.q = process_variance  # Process noise
+        self.r = measurement_variance  # Measurement noise
+        self.dt = 1.0  # Time step
+
+    def predict(self) -> float:
+        """Predict next state."""
+        self.x = self.x + self.v * self.dt
+        self.p = self.p + self.q
+        return self.x
+
+    def update(self, measurement: float) -> float:
+        """Update state with measurement."""
+        # Kalman gain
+        k = self.p / (self.p + self.r)
+        # Update state
+        self.x = self.x + k * (measurement - self.x)
+        # Update velocity (simple: difference from previous)
+        self.v = (measurement - self.x) / self.dt
+        # Update uncertainty
+        self.p = (1 - k) * self.p
+        return self.x
+
+
+class _TrackedObjectState:
+    """Internal state for a tracked object during tracking."""
+
+    def __init__(self, track_id: int, detection: Detection):
+        """Initialize tracking state from a detection."""
+        self.track_id = track_id
+        self.bbox = detection.bbox.copy()
+        self.age = 0
+        self.hits = 0
+        self.misses = 0
+        self.confidence = detection.confidence
+        self.feature = detection.feature.copy() if detection.feature is not None else None
+        self.label = detection.label
+        self.metadata = detection.metadata.copy() if detection.metadata else None
+
+        # Simple Kalman filters for each dimension
+        x1, y1, x2, y2 = self.bbox
+        self.kf_x1 = _KalmanFilterSimple(x1)
+        self.kf_y1 = _KalmanFilterSimple(y1)
+        self.kf_x2 = _KalmanFilterSimple(x2)
+        self.kf_y2 = _KalmanFilterSimple(y2)
+
+    def predict(self) -> np.ndarray:
+        """Predict next bbox."""
+        x1 = self.kf_x1.predict()
+        y1 = self.kf_y1.predict()
+        x2 = self.kf_x2.predict()
+        y2 = self.kf_y2.predict()
+        self.bbox = np.array([x1, y1, x2, y2], dtype=np.float32)
+        self.age += 1
+        return self.bbox.copy()
+
+    def update(self, detection: Detection) -> None:
+        """Update state with a detection."""
+        x1, y1, x2, y2 = detection.bbox
+        self.kf_x1.update(x1)
+        self.kf_y1.update(y1)
+        self.kf_x2.update(x2)
+        self.kf_y2.update(y2)
+        self.bbox = np.array([self.kf_x1.x, self.kf_y1.x, self.kf_x2.x, self.kf_y2.x], dtype=np.float32)
+        self.hits += 1
+        self.misses = 0
+        self.confidence = detection.confidence
+        if detection.feature is not None:
+            self.feature = detection.feature.copy()
+        self.label = detection.label
+        if detection.metadata:
+            self.metadata = detection.metadata.copy()
+
+    def miss(self) -> None:
+        """Record a missed detection."""
+        self.misses += 1
+
+    def to_tracked_object(self) -> TrackedObject:
+        """Convert to output TrackedObject."""
+        return TrackedObject(
+            id=self.track_id,
+            bbox=self.bbox.copy(),
+            age=self.age,
+            hits=self.hits,
+            confidence=self.confidence,
+            feature=self.feature.copy() if self.feature is not None else None,
+            label=self.label,
+            metadata=self.metadata.copy() if self.metadata else None,
+        )
 
 
 class Tracker:
     """
-    The class in charge of performing the tracking of the detections produced by a detector.
+    Simple, transparent multi-object tracker using SORT algorithm.
+
+    This tracker uses bounding boxes to track objects across frames.
+    It implements the SORT (Simple Online and Realtime Tracking) algorithm.
 
     Parameters
     ----------
-    distance_function : Union[str, Callable[[Detection, TrackedObject], float]]
-        Function used by the tracker to determine the distance between newly detected objects and the objects that are currently being tracked.
-        This function should take 2 input arguments, the first being a [Detection][vistrack.tracker.Detection], and the second a [TrackedObject][vistrack.tracker.TrackedObject].
-        It has to return a `float` with the distance it calculates.
-        Some common distances are implemented in [distances][], as a shortcut the tracker accepts the name of these [predefined distances][vistrack.distances.get_distance_by_name].
-        Scipy's predefined distances are also accepted. A `str` with one of the available metrics in
-        [`scipy.spatial.distance.cdist`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.spatial.distance.cdist.html).
-    distance_threshold : float
-        Defines what is the maximum distance that can constitute a match.
-        Detections and tracked objects whose distances are above this threshold won't be matched by the tracker.
-    hit_counter_max : int, optional
-        Each tracked objects keeps an internal hit counter which tracks how often it's getting matched to a detection,
-        each time it gets a match this counter goes up, and each time it doesn't it goes down.
-
-        If it goes below 0 the object gets destroyed. This argument defines how large this inertia can grow,
-        and therefore defines how long an object can live without getting matched to any detections, before it is displaced as a dead object, if no ReID distance function is implemented it will be destroyed.
-    initialization_delay : Optional[int], optional
-         Determines how large the object's hit counter must be in order to be considered as initialized, and get returned to the user as a real object.
-         It must be smaller than `hit_counter_max` or otherwise the object would never be initialized.
-
-         If set to 0, objects will get returned to the user as soon as they are detected for the first time,
-         which can be problematic as this can result in objects appearing and immediately dissapearing.
-
-         Defaults to `hit_counter_max / 2`
-    pointwise_hit_counter_max : int, optional
-        Each tracked object keeps track of how often the points it's tracking have been getting matched.
-        Points that are getting matched (`pointwise_hit_counter > 0`) are said to be live, and points which aren't (`pointwise_hit_counter = 0`)
-        are said to not be live.
-
-        This is used to determine things like which individual points in a tracked object get drawn by [`draw_tracked_objects`][vistrack.drawing.draw_tracked_objects] and which don't.
-        This argument defines how large the inertia for each point of a tracker can grow.
-    detection_threshold : float, optional
-        Sets the threshold at which the scores of the points in a detection being fed into the tracker must dip below to be ignored by the tracker.
-    filter_factory : FilterFactory, optional
-        This parameter can be used to change what filter the [`TrackedObject`][vistrack.tracker.TrackedObject] instances created by the tracker will use.
-        Defaults to [`OptimizedKalmanFilterFactory()`][vistrack.filter.OptimizedKalmanFilterFactory]
-    past_detections_length : int, optional
-        How many past detections to save for each tracked object.
-        Norfair tries to distribute these past detections uniformly through the object's lifetime so they're more representative.
-        Very useful if you want to add metric learning to your model, as you can associate an embedding to each detection and access them in your distance function.
-    reid_distance_function: Optional[Callable[["TrackedObject", "TrackedObject"], float]]
-        Function used by the tracker to determine the ReID distance between newly detected trackers and unmatched trackers by the distance function.
-
-        This function should take 2 input arguments, the first being tracked objects in the initialization phase of type [`TrackedObject`][vistrack.tracker.TrackedObject],
-        and the second being tracked objects that have been unmatched of type [`TrackedObject`][vistrack.tracker.TrackedObject]. It returns a `float` with the distance it
-        calculates.
-    reid_distance_threshold: float
-        Defines what is the maximum ReID distance that can constitute a match.
-
-        Tracked objects whose distance is above this threshold won't be merged, if they are the oldest tracked object will be maintained
-        with the position of the new tracked object.
-    reid_hit_counter_max: Optional[int]
-        Each tracked object keeps an internal ReID hit counter which tracks how often it's getting recognized by another tracker,
-        each time it gets a match this counter goes up, and each time it doesn't it goes down. If it goes below 0 the object gets destroyed.
-        If used, this argument (`reid_hit_counter_max`) defines how long an object can live without getting matched to any detections, before it is destroyed.
+    max_age : int, optional
+        Maximum number of frames to keep a track alive without detections.
+        Default is 30.
+    min_hits : int, optional
+        Minimum number of detections before a track is considered confirmed.
+        Default is 3.
+    iou_threshold : float, optional
+        IoU threshold for matching detections to tracks.
+        Default is 0.3.
     """
 
     def __init__(
         self,
-        distance_function: Union[str, Callable[["Detection", "TrackedObject"], float]],
-        distance_threshold: float,
-        hit_counter_max: int = 15,
-        initialization_delay: Optional[int] = None,
-        pointwise_hit_counter_max: int = 4,
-        detection_threshold: float = 0,
-        filter_factory: FilterFactory = OptimizedKalmanFilterFactory(),
-        past_detections_length: int = 4,
-        reid_distance_function: Optional[
-            Callable[["TrackedObject", "TrackedObject"], float]
-        ] = None,
-        reid_distance_threshold: float = 0,
-        reid_hit_counter_max: Optional[int] = None,
-    ):
-        self.tracked_objects: Sequence["TrackedObject"] = []
-
-        if isinstance(distance_function, str):
-            distance_function = get_distance_by_name(distance_function)
-        elif isinstance(distance_function, Callable):
-            warning(
-                "You are using a scalar distance function. If you want to speed up the"
-                " tracking process please consider using a vectorized distance"
-                f" function such as {AVAILABLE_VECTORIZED_DISTANCES}."
-            )
-            distance_function = ScalarDistance(distance_function)
-        else:
-            raise ValueError(
-                "Argument `distance_function` should be a string or function but is"
-                f" {type(distance_function)} instead."
-            )
-        self.distance_function = distance_function
-
-        self.hit_counter_max = hit_counter_max
-        self.reid_hit_counter_max = reid_hit_counter_max
-        self.pointwise_hit_counter_max = pointwise_hit_counter_max
-        self.filter_factory = filter_factory
-        if past_detections_length >= 0:
-            self.past_detections_length = past_detections_length
-        else:
-            raise ValueError(
-                f"Argument `past_detections_length` is {past_detections_length} and should be larger than 0."
-            )
-
-        if initialization_delay is None:
-            self.initialization_delay = int(self.hit_counter_max / 2)
-        elif initialization_delay < 0 or initialization_delay >= self.hit_counter_max:
-            raise ValueError(
-                f"Argument 'initialization_delay' for 'Tracker' class should be an int between 0 and (hit_counter_max = {hit_counter_max}). The selected value is {initialization_delay}.\n"
-            )
-        else:
-            self.initialization_delay = initialization_delay
-
-        self.distance_threshold = distance_threshold
-        self.detection_threshold = detection_threshold
-        if reid_distance_function is not None:
-            self.reid_distance_function = ScalarDistance(reid_distance_function)
-        else:
-            self.reid_distance_function = reid_distance_function
-        self.reid_distance_threshold = reid_distance_threshold
-        self._obj_factory = _TrackedObjectFactory()
+        max_age: int = 30,
+        min_hits: int = 3,
+        iou_threshold: float = 0.3,
+    ) -> None:
+        """Initialize the tracker."""
+        self.max_age = max_age
+        self.min_hits = min_hits
+        self.iou_threshold = iou_threshold
+        self._track_counter = 0
+        self._tracks: Dict[int, _TrackedObjectState] = {}
 
     def update(
         self,
-        detections: Optional[List["Detection"]] = None,
-        period: int = 1,
-        coord_transformations: Optional[CoordinatesTransformation] = None,
-    ) -> List["TrackedObject"]:
+        detections: Optional[List[Detection]] = None,
+    ) -> List[TrackedObject]:
         """
-        Process detections found in each frame.
-
-        The detections can be matched to previous tracked objects or new ones will be created
-        according to the configuration of the Tracker.
-        The currently alive and initialized tracked objects are returned
+        Update the tracker with new detections.
 
         Parameters
         ----------
-        detections : Optional[List[Detection]], optional
-            A list of [`Detection`][vistrack.tracker.Detection] which represent the detections found in the current frame being processed.
-
-            If no detections have been found in the current frame, or the user is purposely skipping frames to improve video processing time,
-            this argument should be set to None or ignored, as the update function is needed to advance the state of the Kalman Filters inside the tracker.
-        period : int, optional
-            The user can chose not to run their detector on all frames, so as to process video faster.
-            This parameter sets every how many frames the detector is getting ran,
-            so that the tracker is aware of this situation and can handle it properly.
-
-            This argument can be reset on each frame processed,
-            which is useful if the user is dynamically changing how many frames the detector is skipping on a video when working in real-time.
-        coord_transformations: Optional[CoordinatesTransformation]
-            The coordinate transformation calculated by the [MotionEstimator][vistrack.camera_motion.MotionEstimator].
+        detections : Optional[List[Detection]]
+            List of detections from an object detector. If None or empty,
+            the tracker will advance time but return only confirmed tracks.
 
         Returns
         -------
         List[TrackedObject]
-            The list of active tracked objects.
+            List of confirmed tracks (age >= min_hits).
         """
-        if coord_transformations is not None:
-            for det in detections:
-                det.update_coordinate_transformation(coord_transformations)
+        if detections is None:
+            detections = []
 
-        # Remove stale trackers and make candidate object real if the hit counter is positive
-        alive_objects = []
-        dead_objects = []
-        if self.reid_hit_counter_max is None:
-            self.tracked_objects = [
-                o for o in self.tracked_objects if o.hit_counter_is_positive
-            ]
-            alive_objects = self.tracked_objects
-        else:
-            tracked_objects = []
-            for o in self.tracked_objects:
-                if o.reid_hit_counter_is_positive:
-                    tracked_objects.append(o)
-                    if o.hit_counter_is_positive:
-                        alive_objects.append(o)
-                    else:
-                        dead_objects.append(o)
-            self.tracked_objects = tracked_objects
+        # Predict new positions for all tracks
+        predicted_bboxes = {}
+        for track_id, track in self._tracks.items():
+            predicted_bboxes[track_id] = track.predict()
 
-        # Update tracker
-        for obj in self.tracked_objects:
-            obj.tracker_step()
-            obj.update_coordinate_transformation(coord_transformations)
-
-        # Update initialized tracked objects with detections
-        (
-            unmatched_detections,
-            _,
-            unmatched_init_trackers,
-        ) = self._update_objects_in_place(
-            self.distance_function,
-            self.distance_threshold,
-            [o for o in alive_objects if not o.is_initializing],
-            detections,
-            period,
+        # Match detections to tracks
+        matched_pairs, unmatched_detections, unmatched_tracks = self._match_detections(
+            detections, predicted_bboxes
         )
 
-        # Update not yet initialized tracked objects with yet unmatched detections
-        (
-            unmatched_detections,
-            matched_not_init_trackers,
-            _,
-        ) = self._update_objects_in_place(
-            self.distance_function,
-            self.distance_threshold,
-            [o for o in alive_objects if o.is_initializing],
-            unmatched_detections,
-            period,
-        )
+        # Update matched tracks
+        for track_id, det_idx in matched_pairs:
+            self._tracks[track_id].update(detections[det_idx])
 
-        if self.reid_distance_function is not None:
-            # Match unmatched initialized tracked objects with not yet initialized tracked objects
-            _, _, _ = self._update_objects_in_place(
-                self.reid_distance_function,
-                self.reid_distance_threshold,
-                unmatched_init_trackers + dead_objects,
-                matched_not_init_trackers,
-                period,
-            )
+        # Mark unmatched tracks as missed
+        for track_id in unmatched_tracks:
+            self._tracks[track_id].miss()
 
-        # Create new tracked objects from remaining unmatched detections
-        for detection in unmatched_detections:
-            self.tracked_objects.append(
-                self._obj_factory.create(
-                    initial_detection=detection,
-                    hit_counter_max=self.hit_counter_max,
-                    initialization_delay=self.initialization_delay,
-                    pointwise_hit_counter_max=self.pointwise_hit_counter_max,
-                    detection_threshold=self.detection_threshold,
-                    period=period,
-                    filter_factory=self.filter_factory,
-                    past_detections_length=self.past_detections_length,
-                    reid_hit_counter_max=self.reid_hit_counter_max,
-                    coord_transformations=coord_transformations,
-                )
-            )
+        # Create new tracks from unmatched detections
+        for det_idx in unmatched_detections:
+            self._track_counter += 1
+            self._tracks[self._track_counter] = _TrackedObjectState(self._track_counter, detections[det_idx])
 
-        return self.get_active_objects()
+        # Remove stale tracks and return confirmed tracks
+        result = []
+        tracks_to_remove = []
+        for track_id, track in self._tracks.items():
+            if track.misses > self.max_age:
+                tracks_to_remove.append(track_id)
+            elif track.hits >= self.min_hits:
+                result.append(track.to_tracked_object())
 
-    @property
-    def current_object_count(self) -> int:
-        """Number of active TrackedObjects"""
-        return len(self.get_active_objects())
+        for track_id in tracks_to_remove:
+            del self._tracks[track_id]
 
-    @property
-    def total_object_count(self) -> int:
-        """Total number of TrackedObjects initialized in the by this Tracker"""
-        return self._obj_factory.count
+        return result
 
-    def get_active_objects(self) -> List["TrackedObject"]:
-        """Get the list of active objects
+    def _match_detections(
+        self,
+        detections: List[Detection],
+        predicted_bboxes: Dict[int, np.ndarray],
+    ) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
+        """
+        Match detections to tracks using IoU distance.
 
         Returns
         -------
-        List["TrackedObject"]
-            The list of active objects
+        matched_pairs : List[Tuple[int, int]]
+            List of (track_id, detection_idx) pairs
+        unmatched_detections : List[int]
+            Indices of detections that weren't matched
+        unmatched_tracks : List[int]
+            IDs of tracks that weren't matched
         """
-        return [
-            o
-            for o in self.tracked_objects
-            if not o.is_initializing and o.hit_counter_is_positive
-        ]
+        matched_pairs = []
+        unmatched_detections = set(range(len(detections)))
+        unmatched_tracks = set(self._tracks.keys())
 
-    def _update_objects_in_place(
-        self,
-        distance_function,
-        distance_threshold,
-        objects: Sequence["TrackedObject"],
-        candidates: Optional[Union[List["Detection"], List["TrackedObject"]]],
-        period: int,
-    ):
-        if candidates is not None and len(candidates) > 0:
-            distance_matrix = distance_function.get_distances(objects, candidates)
-            if np.isnan(distance_matrix).any():
-                raise ValueError(
-                    "\nReceived nan values from distance function, please check your distance function for errors!"
-                )
+        if len(detections) == 0 or len(self._tracks) == 0:
+            return matched_pairs, list(unmatched_detections), list(unmatched_tracks)
 
-            # Used just for debugging distance function
-            if distance_matrix.any():
-                for i, minimum in enumerate(distance_matrix.min(axis=0)):
-                    objects[i].current_min_distance = (
-                        minimum if minimum < distance_threshold else None
-                    )
+        # Build distance matrix
+        distance_matrix = np.zeros((len(detections), len(self._tracks)))
+        track_ids = list(self._tracks.keys())
 
-            matched_cand_indices, matched_obj_indices = self.match_dets_and_objs(
-                distance_matrix, distance_threshold
-            )
-            if len(matched_cand_indices) > 0:
-                unmatched_candidates = [
-                    d for i, d in enumerate(candidates) if i not in matched_cand_indices
-                ]
-                unmatched_objects = [
-                    d for i, d in enumerate(objects) if i not in matched_obj_indices
-                ]
-                matched_objects = []
+        for det_idx, detection in enumerate(detections):
+            for track_idx, track_id in enumerate(track_ids):
+                pred_bbox = predicted_bboxes[track_id]
+                iou = self._compute_iou(detection.bbox, pred_bbox)
+                # Distance = 1 - IoU
+                distance_matrix[det_idx, track_idx] = 1.0 - iou
 
-                # Handle matched people/detections
-                for (match_cand_idx, match_obj_idx) in zip(
-                    matched_cand_indices, matched_obj_indices
-                ):
-                    match_distance = distance_matrix[match_cand_idx, match_obj_idx]
-                    matched_candidate = candidates[match_cand_idx]
-                    matched_object = objects[match_obj_idx]
-                    if match_distance < distance_threshold:
-                        if isinstance(matched_candidate, Detection):
-                            matched_object.hit(matched_candidate, period=period)
-                            matched_object.last_distance = match_distance
-                            matched_objects.append(matched_object)
-                        elif isinstance(matched_candidate, TrackedObject):
-                            # Merge new TrackedObject with the old one
-                            matched_object.merge(matched_candidate)
-                            # If we are matching TrackedObject instances we want to get rid of the
-                            # already matched candidate to avoid matching it again in future frames
-                            self.tracked_objects.remove(matched_candidate)
-                    else:
-                        unmatched_candidates.append(matched_candidate)
-                        unmatched_objects.append(matched_object)
-            else:
-                unmatched_candidates, matched_objects, unmatched_objects = (
-                    candidates,
-                    [],
-                    objects,
-                )
-        else:
-            unmatched_candidates, matched_objects, unmatched_objects = [], [], objects
+        # Greedy matching: match minimum distances first
+        while True:
+            if distance_matrix.size == 0:
+                break
 
-        return unmatched_candidates, matched_objects, unmatched_objects
+            min_idx = np.argmin(distance_matrix)
+            det_idx, track_idx = np.unravel_index(min_idx, distance_matrix.shape)
+            distance = distance_matrix[det_idx, track_idx]
 
-    def match_dets_and_objs(self, distance_matrix: np.ndarray, distance_threshold):
-        """Matches detections with tracked_objects from a distance matrix
+            if distance >= self.iou_threshold:
+                break  # No more good matches
 
-        I used to match by minimizing the global distances, but found several
-        cases in which this was not optimal. So now I just match by starting
-        with the global minimum distance and matching the det-obj corresponding
-        to that distance, then taking the second minimum, and so on until we
-        reach the distance_threshold.
+            track_id = track_ids[track_idx]
+            matched_pairs.append((track_id, det_idx))
+            unmatched_detections.discard(det_idx)
+            unmatched_tracks.discard(track_id)
 
-        This avoids the the algorithm getting cute with us and matching things
-        that shouldn't be matching just for the sake of minimizing the global
-        distance, which is what used to happen
-        """
-        # NOTE: This implementation is terribly inefficient, but it doesn't
-        #       seem to affect the fps at all.
-        distance_matrix = distance_matrix.copy()
-        if distance_matrix.size > 0:
-            det_idxs = []
-            obj_idxs = []
-            current_min = distance_matrix.min()
+            # Remove matched detection and track from future consideration
+            distance_matrix = np.delete(distance_matrix, det_idx, axis=0)
+            distance_matrix = np.delete(distance_matrix, track_idx, axis=1)
+            track_ids.pop(track_idx)
 
-            while current_min < distance_threshold:
-                flattened_arg_min = distance_matrix.argmin()
-                det_idx = flattened_arg_min // distance_matrix.shape[1]
-                obj_idx = flattened_arg_min % distance_matrix.shape[1]
-                det_idxs.append(det_idx)
-                obj_idxs.append(obj_idx)
-                distance_matrix[det_idx, :] = distance_threshold + 1
-                distance_matrix[:, obj_idx] = distance_threshold + 1
-                current_min = distance_matrix.min()
+        return matched_pairs, list(unmatched_detections), list(unmatched_tracks)
 
-            return det_idxs, obj_idxs
-        else:
-            return [], []
+    @staticmethod
+    def _compute_iou(bbox1: np.ndarray, bbox2: np.ndarray) -> float:
+        """Compute IoU between two bounding boxes [x1, y1, x2, y2]."""
+        x1_a, y1_a, x2_a, y2_a = bbox1
+        x1_b, y1_b, x2_b, y2_b = bbox2
 
+        # Intersection
+        xi1 = max(x1_a, x1_b)
+        yi1 = max(y1_a, y1_b)
+        xi2 = min(x2_a, x2_b)
+        yi2 = min(y2_a, y2_b)
 
-class _TrackedObjectFactory:
-    global_count = 0
+        inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
 
-    def __init__(self) -> None:
-        self.count = 0
-        self.initializing_count = 0
+        # Union
+        area_a = (x2_a - x1_a) * (y2_a - y1_a)
+        area_b = (x2_b - x1_b) * (y2_b - y1_b)
+        union_area = area_a + area_b - inter_area
 
-    def create(
-        self,
-        initial_detection: "Detection",
-        hit_counter_max: int,
-        initialization_delay: int,
-        pointwise_hit_counter_max: int,
-        detection_threshold: float,
-        period: int,
-        filter_factory: "FilterFactory",
-        past_detections_length: int,
-        reid_hit_counter_max: Optional[int],
-        coord_transformations: CoordinatesTransformation,
-    ) -> "TrackedObject":
-        obj = TrackedObject(
-            obj_factory=self,
-            initial_detection=initial_detection,
-            hit_counter_max=hit_counter_max,
-            initialization_delay=initialization_delay,
-            pointwise_hit_counter_max=pointwise_hit_counter_max,
-            detection_threshold=detection_threshold,
-            period=period,
-            filter_factory=filter_factory,
-            past_detections_length=past_detections_length,
-            reid_hit_counter_max=reid_hit_counter_max,
-            coord_transformations=coord_transformations,
-        )
-        return obj
+        if union_area == 0:
+            return 0.0
 
-    def get_initializing_id(self) -> int:
-        self.initializing_count += 1
-        return self.initializing_count
-
-    def get_ids(self) -> Tuple[int, int]:
-        self.count += 1
-        _TrackedObjectFactory.global_count += 1
-        return self.count, _TrackedObjectFactory.global_count
-
-
-class TrackedObject:
-    """
-    The objects returned by the tracker's `update` function on each iteration.
-
-    They represent the objects currently being tracked by the tracker.
-
-    Users should not instantiate TrackedObjects manually;
-    the Tracker will be in charge of creating them.
-
-    Attributes
-    ----------
-    estimate : np.ndarray
-        Where the tracker predicts the point will be in the current frame based on past detections.
-        A numpy array with the same shape as the detections being fed to the tracker that produced it.
-    id : Optional[int]
-        The unique identifier assigned to this object by the tracker. Set to `None` if the object is initializing.
-    global_id : Optional[int]
-        The globally unique identifier assigned to this object. Set to `None` if the object is initializing
-    last_detection : Detection
-        The last detection that matched with this tracked object.
-        Useful if you are storing embeddings in your detections and want to do metric learning, or for debugging.
-    last_distance : Optional[float]
-        The distance the tracker had with the last object it matched with.
-    age : int
-        The age of this object measured in number of frames.
-    live_points :
-        A boolean mask with shape `(n_points,)`. Points marked as `True` have recently been matched with detections.
-        Points marked as `False` haven't and are to be considered stale, and should be ignored.
-
-        Functions like [`draw_tracked_objects`][vistrack.drawing.draw_tracked_objects] use this property to determine which points not to draw.
-    initializing_id : int
-        On top of `id`, objects also have an `initializing_id` which is the id they are given internally by the `Tracker`;
-        this id is used solely for debugging.
-
-        Each new object created by the `Tracker` starts as an uninitialized `TrackedObject`,
-        which needs to reach a certain match rate to be converted into a full blown `TrackedObject`.
-        `initializing_id` is the id temporarily assigned to `TrackedObject` while they are getting initialized.
-    """
-
-    def __init__(
-        self,
-        obj_factory: _TrackedObjectFactory,
-        initial_detection: "Detection",
-        hit_counter_max: int,
-        initialization_delay: int,
-        pointwise_hit_counter_max: int,
-        detection_threshold: float,
-        period: int,
-        filter_factory: "FilterFactory",
-        past_detections_length: int,
-        reid_hit_counter_max: Optional[int],
-        coord_transformations: Optional[CoordinatesTransformation] = None,
-    ):
-        if not isinstance(initial_detection, Detection):
-            raise ValueError(
-                f"\n[red]ERROR[/red]: The detection list fed into `tracker.update()` should be composed of {Detection} objects not {type(initial_detection)}.\n"
-            )
-        self._obj_factory = obj_factory
-        self.dim_points = initial_detection.absolute_points.shape[1]
-        self.num_points = initial_detection.absolute_points.shape[0]
-        self.hit_counter_max: int = hit_counter_max
-        self.pointwise_hit_counter_max: int = max(pointwise_hit_counter_max, period)
-        self.initialization_delay = initialization_delay
-        self.detection_threshold: float = detection_threshold
-        self.initial_period: int = period
-        self.hit_counter: int = period
-        self.reid_hit_counter_max = reid_hit_counter_max
-        self.reid_hit_counter: Optional[int] = None
-        self.last_distance: Optional[float] = None
-        self.current_min_distance: Optional[float] = None
-        self.last_detection: "Detection" = initial_detection
-        self.age: int = 0
-        self.is_initializing: bool = self.hit_counter <= self.initialization_delay
-
-        self.initializing_id: Optional[int] = self._obj_factory.get_initializing_id()
-        self.id: Optional[int] = None
-        self.global_id: Optional[int] = None
-        if not self.is_initializing:
-            self._acquire_ids()
-
-        if initial_detection.scores is None:
-            self.detected_at_least_once_points = np.array([True] * self.num_points)
-        else:
-            self.detected_at_least_once_points = (
-                initial_detection.scores > self.detection_threshold
-            )
-        self.point_hit_counter: np.ndarray = self.detected_at_least_once_points.astype(
-            int
-        )
-        initial_detection.age = self.age
-        self.past_detections_length = past_detections_length
-        if past_detections_length > 0:
-            self.past_detections: Sequence["Detection"] = [initial_detection]
-        else:
-            self.past_detections: Sequence["Detection"] = []
-
-        # Create Kalman Filter
-        self.filter = filter_factory.create_filter(initial_detection.absolute_points)
-        self.dim_z = self.dim_points * self.num_points
-        self.label = initial_detection.label
-        self.abs_to_rel = None
-        if coord_transformations is not None:
-            self.update_coordinate_transformation(coord_transformations)
-
-    def tracker_step(self):
-        if self.reid_hit_counter is None:
-            if self.hit_counter <= 0:
-                self.reid_hit_counter = self.reid_hit_counter_max
-        else:
-            self.reid_hit_counter -= 1
-        self.hit_counter -= 1
-        self.point_hit_counter -= 1
-        self.age += 1
-        # Advances the tracker's state
-        self.filter.predict()
+        return float(inter_area / union_area)
 
     @property
-    def hit_counter_is_positive(self):
-        return self.hit_counter >= 0
+    def current_track_count(self) -> int:
+        """Number of currently active and confirmed tracks."""
+        return len([t for t in self._tracks.values() if t.hits >= self.min_hits])
 
-    @property
-    def reid_hit_counter_is_positive(self):
-        return self.reid_hit_counter is None or self.reid_hit_counter >= 0
-
-    @property
-    def estimate_velocity(self) -> np.ndarray:
-        """Get the velocity estimate of the object from the Kalman filter. This velocity is in the absolute coordinate system.
-
-        Returns
-        -------
-        np.ndarray
-            An array of shape (self.num_points, self.dim_points) containing the velocity estimate of the object on each axis.
-        """
-        return self.filter.x.T.flatten()[self.dim_z :].reshape(-1, self.dim_points)
-
-    @property
-    def estimate(self) -> np.ndarray:
-        """Get the position estimate of the object from the Kalman filter.
-
-        Returns
-        -------
-        np.ndarray
-            An array of shape (self.num_points, self.dim_points) containing the position estimate of the object on each axis.
-        """
-        return self.get_estimate()
-
-    def get_estimate(self, absolute=False) -> np.ndarray:
-        """Get the position estimate of the object from the Kalman filter in an absolute or relative format.
-
-        Parameters
-        ----------
-        absolute : bool, optional
-            If true the coordinates are returned in absolute format, by default False, by default False.
-
-        Returns
-        -------
-        np.ndarray
-            An array of shape (self.num_points, self.dim_points) containing the position estimate of the object on each axis.
-
-        Raises
-        ------
-        ValueError
-            Alert if the coordinates are requested in absolute format but the tracker has no coordinate transformation.
-        """
-        positions = self.filter.x.T.flatten()[: self.dim_z].reshape(-1, self.dim_points)
-        if self.abs_to_rel is None:
-            if not absolute:
-                return positions
-            else:
-                raise ValueError(
-                    "You must provide 'coord_transformations' to the tracker to get absolute coordinates"
-                )
-        else:
-            if absolute:
-                return positions
-            else:
-                return self.abs_to_rel(positions)
-
-    @property
-    def live_points(self):
-        return self.point_hit_counter > 0
-
-    def hit(self, detection: "Detection", period: int = 1):
-        """Update tracked object with a new detection
-
-        Parameters
-        ----------
-        detection : Detection
-            the new detection matched to this tracked object
-        period : int, optional
-            frames corresponding to the period of time since last update.
-        """
-        self._conditionally_add_to_past_detections(detection)
-
-        self.last_detection = detection
-        self.hit_counter = min(self.hit_counter + 2 * period, self.hit_counter_max)
-
-        if self.is_initializing and self.hit_counter > self.initialization_delay:
-            self.is_initializing = False
-            self._acquire_ids()
-
-        # We use a kalman filter in which we consider each coordinate on each point as a sensor.
-        # This is a hacky way to update only certain sensors (only x, y coordinates for
-        # points which were detected).
-        # TODO: Use keypoint confidence information to change R on each sensor instead?
-        if detection.scores is not None:
-            assert len(detection.scores.shape) == 1
-            points_over_threshold_mask = detection.scores > self.detection_threshold
-            matched_sensors_mask = np.array(
-                [(m,) * self.dim_points for m in points_over_threshold_mask]
-            ).flatten()
-            H_pos = np.diag(matched_sensors_mask).astype(
-                float
-            )  # We measure x, y positions
-            self.point_hit_counter[points_over_threshold_mask] += 2 * period
-        else:
-            points_over_threshold_mask = np.array([True] * self.num_points)
-            H_pos = np.identity(self.num_points * self.dim_points)
-            self.point_hit_counter += 2 * period
-        self.point_hit_counter[
-            self.point_hit_counter >= self.pointwise_hit_counter_max
-        ] = self.pointwise_hit_counter_max
-        self.point_hit_counter[self.point_hit_counter < 0] = 0
-        H_vel = np.zeros(H_pos.shape)  # But we don't directly measure velocity
-        H = np.hstack([H_pos, H_vel])
-        self.filter.update(
-            np.expand_dims(detection.absolute_points.flatten(), 0).T, None, H
-        )
-
-        detected_at_least_once_mask = np.array(
-            [(m,) * self.dim_points for m in self.detected_at_least_once_points]
-        ).flatten()
-        now_detected_mask = np.hstack(
-            (points_over_threshold_mask,) * self.dim_points
-        ).flatten()
-        first_detection_mask = np.logical_and(
-            now_detected_mask, np.logical_not(detected_at_least_once_mask)
-        )
-
-        self.filter.x[: self.dim_z][first_detection_mask] = np.expand_dims(
-            detection.absolute_points.flatten(), 0
-        ).T[first_detection_mask]
-
-        # Force points being detected for the first time to have velocity = 0
-        # This is needed because some detectors (like OpenPose) set points with
-        # low confidence to coordinates (0, 0). And when they then get their first
-        # real detection this creates a huge velocity vector in our KalmanFilter
-        # and causes the tracker to start with wildly inaccurate estimations which
-        # eventually coverge to the real detections.
-        self.filter.x[self.dim_z :][np.logical_not(detected_at_least_once_mask)] = 0
-        self.detected_at_least_once_points = np.logical_or(
-            self.detected_at_least_once_points, points_over_threshold_mask
-        )
-
-    def __repr__(self):
-        if self.last_distance is None:
-            placeholder_text = "\033[1mObject_{}\033[0m(age: {}, hit_counter: {}, last_distance: {}, init_id: {})"
-        else:
-            placeholder_text = "\033[1mObject_{}\033[0m(age: {}, hit_counter: {}, last_distance: {:.2f}, init_id: {})"
-        return placeholder_text.format(
-            self.id,
-            self.age,
-            self.hit_counter,
-            self.last_distance,
-            self.initializing_id,
-        )
-
-    def _conditionally_add_to_past_detections(self, detection):
-        """Adds detections into (and pops detections away) from `past_detections`
-
-        It does so by keeping a fixed amount of past detections saved into each
-        TrackedObject, while maintaining them distributed uniformly through the object's
-        lifetime.
-        """
-        if self.past_detections_length == 0:
-            return
-        if len(self.past_detections) < self.past_detections_length:
-            detection.age = self.age
-            self.past_detections.append(detection)
-        elif self.age >= self.past_detections[0].age * self.past_detections_length:
-            self.past_detections.pop(0)
-            detection.age = self.age
-            self.past_detections.append(detection)
-
-    def merge(self, tracked_object):
-        """Merge with a not yet initialized TrackedObject instance"""
-        self.reid_hit_counter = None
-        self.hit_counter = self.initial_period * 2
-        self.point_hit_counter = tracked_object.point_hit_counter
-        self.last_distance = tracked_object.last_distance
-        self.current_min_distance = tracked_object.current_min_distance
-        self.last_detection = tracked_object.last_detection
-        self.detected_at_least_once_points = (
-            tracked_object.detected_at_least_once_points
-        )
-        self.filter = tracked_object.filter
-
-        for past_detection in tracked_object.past_detections:
-            self._conditionally_add_to_past_detections(past_detection)
-
-    def update_coordinate_transformation(
-        self, coordinate_transformation: CoordinatesTransformation
-    ):
-        if coordinate_transformation is not None:
-            self.abs_to_rel = coordinate_transformation.abs_to_rel
-
-    def _acquire_ids(self):
-        self.id, self.global_id = self._obj_factory.get_ids()
-
-
-class Detection:
-    """Detections returned by the detector must be converted to a `Detection` object before being used by Norfair.
-
-    Parameters
-    ----------
-    points : np.ndarray
-        Points detected. Must be a rank 2 array with shape `(n_points, n_dimensions)` where n_dimensions is 2 or 3.
-    scores : np.ndarray, optional
-        An array of length `n_points` which assigns a score to each of the points defined in `points`.
-
-        This is used to inform the tracker of which points to ignore;
-        any point with a score below `detection_threshold` will be ignored.
-
-        This useful for cases in which detections don't always have every point present, as is often the case in pose estimators.
-    data : Any, optional
-        The place to store any extra data which may be useful when calculating the distance function.
-        Anything stored here will be available to use inside the distance function.
-
-        This enables the development of more interesting trackers which can do things like assign an appearance embedding to each
-        detection to aid in its tracking.
-    label : Hashable, optional
-        When working with multiple classes the detection's label can be stored to be used as a matching condition when associating
-        tracked objects with new detections. Label's type must be hashable for drawing purposes.
-    embedding : Any, optional
-        The embedding for the reid_distance.
-    """
-
-    def __init__(
-        self,
-        points: np.ndarray,
-        scores: np.ndarray = None,
-        data: Any = None,
-        label: Hashable = None,
-        embedding=None,
-    ):
-        self.points = validate_points(points)
-        self.scores = scores
-        self.data = data
-        self.label = label
-        self.absolute_points = self.points.copy()
-        self.embedding = embedding
-        self.age = None
-
-    def update_coordinate_transformation(
-        self, coordinate_transformation: CoordinatesTransformation
-    ):
-        if coordinate_transformation is not None:
-            self.absolute_points = coordinate_transformation.rel_to_abs(
-                self.absolute_points
-            )
+    def reset(self) -> None:
+        """Reset the tracker, clearing all tracks."""
+        self._tracks.clear()
+        self._track_counter = 0

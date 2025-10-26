@@ -11,11 +11,12 @@
 [![DOI](https://zenodo.org/badge/276473370.svg)](https://zenodo.org/badge/latestdoi/276473370)
 [![License](https://img.shields.io/github/license/tryolabs/vistrack)](https://github.com/tryolabs/vistrack/blob/master/LICENSE)
 
-**Vistrack** is a fork of Norfair that uses `bayesian-filters` instead of `filterpy` for the Kalman filter implementation.
+**Vistrack** is a lightweight, high-performance Python library for real-time multi-object tracking with bounding boxes.
 
-Vistrack is a customizable lightweight Python library for real-time multi-object tracking.
+Vistrack implements the SORT (Simple Online and Realtime Tracking) algorithm with a clean, transparent Python implementation.
+It's designed to be simple, fast, and easy to integrate into any detector pipeline.
 
-Using Vistrack, you can add tracking capabilities to any detector with just a few lines of code.
+Using Vistrack, you can add tracking capabilities to any object detector with just a few lines of code.
 
 |                                           Tracking players with moving camera                                           |                                           Tracking 3D objects                                           |
 | :---------------------------------------------------------------------------------------------------------------------: | :-----------------------------------------------------------------------------------------------------: |
