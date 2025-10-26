@@ -1,0 +1,44 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.11, pytest-8.4.2, pluggy-1.6.0 -- /home/georgepearse/vistrack/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/georgepearse/vistrack
+configfile: pyproject.toml
+collecting ... collected 25 items
+
+tests/test_distances.py::test_frobenius PASSED                           [  4%]
+tests/test_distances.py::test_mean_manhattan PASSED                      [  8%]
+tests/test_distances.py::test_mean_euclidean PASSED                      [ 12%]
+tests/test_distances.py::test_iou PASSED                                 [ 16%]
+tests/test_distances.py::test_keypoint_vote PASSED                       [ 20%]
+tests/test_distances.py::test_normalized_euclidean PASSED                [ 24%]
+tests/test_distances.py::test_scalar_distance PASSED                     [ 28%]
+tests/test_distances.py::test_vectorized_distance PASSED                 [ 32%]
+tests/test_distances.py::test_scipy_distance PASSED                      [ 36%]
+tests/test_drawing.py::test_hex_parsing PASSED                           [ 40%]
+tests/test_tracker.py::test_params PASSED                                [ 44%]
+tests/test_tracker.py::test_simple[filter_factory0] PASSED               [ 48%]
+tests/test_tracker.py::test_simple[filter_factory1] PASSED               [ 52%]
+tests/test_tracker.py::test_moving[filter_factory0] PASSED               [ 56%]
+tests/test_tracker.py::test_moving[filter_factory1] PASSED               [ 60%]
+tests/test_tracker.py::test_distance_t[filter_factory0] PASSED           [ 64%]
+tests/test_tracker.py::test_distance_t[filter_factory1] PASSED           [ 68%]
+tests/test_tracker.py::test_1d_points[filter_factory0] PASSED            [ 72%]
+tests/test_tracker.py::test_1d_points[filter_factory1] PASSED            [ 76%]
+tests/test_tracker.py::test_camera_motion PASSED                         [ 80%]
+tests/test_tracker.py::test_count[0] PASSED                              [ 84%]
+tests/test_tracker.py::test_count[1] PASSED                              [ 88%]
+tests/test_tracker.py::test_count[3] PASSED                              [ 92%]
+tests/test_tracker.py::test_multiple_trackers PASSED                     [ 96%]
+tests/test_tracker.py::test_reid_hit_counter PASSED                      [100%]
+
+=============================== warnings summary ===============================
+.venv/lib/python3.12/site-packages/bayesian_filters/discrete_bayes/discrete_bayes.py:20
+  /home/georgepearse/vistrack/.venv/lib/python3.12/site-packages/bayesian_filters/discrete_bayes/discrete_bayes.py:20: DeprecationWarning: Please import `convolve` from the `scipy.ndimage` namespace; the `scipy.ndimage.filters` namespace is deprecated and will be removed in SciPy 2.0.0.
+    from scipy.ndimage.filters import convolve
+
+.venv/lib/python3.12/site-packages/bayesian_filters/discrete_bayes/discrete_bayes.py:21
+  /home/georgepearse/vistrack/.venv/lib/python3.12/site-packages/bayesian_filters/discrete_bayes/discrete_bayes.py:21: DeprecationWarning: Please import `shift` from the `scipy.ndimage` namespace; the `scipy.ndimage.interpolation` namespace is deprecated and will be removed in SciPy 2.0.0.
+    from scipy.ndimage.interpolation import shift
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================== 25 passed, 2 warnings in 0.17s ========================

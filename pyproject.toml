@@ -1,0 +1,70 @@
+[project]
+name = "vistrack"
+version = "2.3.0"
+description = "Lightweight Python library for adding real-time multi-object tracking to any detector."
+license = {text = "BSD-3-Clause"}
+authors = [{name = "Tryolabs", email = "hello@tryolabs.com"}]
+readme = "README.md"
+requires-python = ">=3.9"
+keywords = [
+    "tracking",
+    "object-detection",
+    "object-tracking",
+    "kalman-filter",
+    "pose-estimation",
+    "re-identification",
+    "multi-object-tracking",
+    "re-id",
+    "tracking-algorithm",
+    "deepsort",
+    "video-tracking",
+    "video-inference-loop"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Multimedia :: Video"
+]
+dependencies = [
+    "bayesian-filters>=1.4.5",
+    "rich>=9.10.0,<15.0.0",
+    "scipy>=1.5.4",
+    "numpy>=1.23.0",
+]
+
+[project.optional-dependencies]
+metrics = ["motmetrics==1.4.0"]
+video = ["opencv-python>=3.2.0,<5.0.0"]
+all = ["motmetrics==1.4.0", "opencv-python>=3.2.0,<5.0.0"]
+dev = ["pytest>=6.2.5", "ruff>=0.1.0", "pyright>=1.1.0", "tox>=3.26.0"]
+
+[project.urls]
+repository = "https://github.com/tryolabs/vistrack"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]  # Line too long - ignore for existing codebase
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401", "F403"]  # Import * is allowed for __init__
+
+[tool.pyright]
+python_version = "3.9"
+type_checking_mode = "basic"
+ignore = ["vistrack/**/*.py"]  # Relaxed type checking for existing codebase
